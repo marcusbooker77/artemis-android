@@ -549,20 +549,12 @@ public class NvHTTP {
 
     public boolean getServerSupportsVDisplay(String serverInfo) throws XmlPullParserException, IOException {
         String supportVdisplay = getXmlString(serverInfo, "VirtualDisplayCapable", false);
-        if (supportVdisplay == null) {
-            return false;
-        }
-
-        return supportVdisplay.equals("true");
+        return isTruthyXmlBoolean(supportVdisplay);
     }
 
     public boolean getServerVDisplayDriverReady(String serverInfo) throws XmlPullParserException, IOException {
         String driverReady = getXmlString(serverInfo, "VirtualDisplayDriverReady", false);
-        if (driverReady == null) {
-            return false;
-        }
-
-        return driverReady.equals("true");
+        return isTruthyXmlBoolean(driverReady);
     }
 
     public List<String> getServerCmds(String serverInfo) throws XmlPullParserException, IOException {
@@ -836,6 +828,18 @@ public class NvHTTP {
     }
 
     final private static char[] hexArray = "0123456789ABCDEF".toCharArray();
+
+    private static boolean isTruthyXmlBoolean(String value) {
+        if (value == null) {
+            return false;
+        }
+
+        String normalized = value.trim();
+        return normalized.equalsIgnoreCase("true") ||
+                normalized.equals("1") ||
+                normalized.equalsIgnoreCase("yes");
+    }
+
     private static String bytesToHex(byte[] bytes) {
         char[] hexChars = new char[bytes.length * 2];
         for ( int j = 0; j < bytes.length; j++ ) {
