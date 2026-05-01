@@ -1,5 +1,6 @@
 package com.limelight.nvstream.jni;
 
+import com.limelight.LimeLog;
 import com.limelight.nvstream.NvConnectionListener;
 import com.limelight.nvstream.av.audio.AudioRenderer;
 import com.limelight.nvstream.av.video.VideoDecoderRenderer;
@@ -439,12 +440,22 @@ public class MoonBridge {
         serverStatsListener = listener;
     }
 
+    private static int shortServerStatsWarnCount = 0;
+
     /**
      * Called from native code when a server stats message (type 0x3004) is received.
-     * Payload: 6 bytes - [0-1] bitrate (uint16 LE), [2] fec%, [3] thermal, [4-5] reserved.
+     * Payload: 6 bytes - [0-1] bitrate (uint16 LE), [2] fec%, [3] thermal, [4-5] reserved (must be 0).
+     * Apollo (the C++ source of truth) emits all 6 bytes; shorter payloads are dropped.
      */
     public static void bridgeClServerStats(byte[] payload) {
-        if (serverStatsListener != null && payload != null && payload.length >= 4) {
+        if (payload == null || payload.length < 6) {
+            // Rate-limit: only log the first short payload.
+            if (payload != null && shortServerStatsWarnCount++ == 0) {
+                LimeLog.warning("bridgeClServerStats: short payload " + payload.length + " bytes; expected 6");
+            }
+            return;
+        }
+        if (serverStatsListener != null) {
             int bitrate = (payload[0] & 0xFF) | ((payload[1] & 0xFF) << 8);
             int fecPct = payload[2] & 0xFF;
             int thermal = payload[3] & 0xFF;
@@ -453,12 +464,33 @@ public class MoonBridge {
     }
 
     /**
+     * True once the native moonlight-common-c extension that backs
+     * sendWifiQuality (e.g. LiSendWifiQualityToServer) is wired through JNI.
+     * While this remains false, sendWifiQuality is a no-op and callers
+     * (see WifiMonitor.buildWifiQualityPayload) skip their payload allocation.
+     *
+     * To enable: implement the JNI side, then flip this to true (ideally
+     * from native init) so the Java path activates without a rebuild of
+     * call sites.
+     */
+    public static volatile boolean sendWifiQualityImplemented = false;
+
+    private static volatile boolean sendWifiQualityWarned = false;
+
+    /**
      * Send WiFi quality data to the server via the control channel (type 0x3003).
-     * This is a stub until the native moonlight-common-c extension is compiled.
+     * No-op until {@link #sendWifiQualityImplemented} is set to true and the
+     * native moonlight-common-c extension is in place.
      * Payload format: [0] quality, [1] rssi (signed), [2-3] linkSpeed (uint16 LE).
      */
     public static void sendWifiQuality(byte[] payload) {
-        // TODO: Implement native method once moonlight-common-c has the extension
-        // For now this is a no-op to avoid JNI linkage errors
+        if (!sendWifiQualityImplemented) {
+            if (!sendWifiQualityWarned) {
+                sendWifiQualityWarned = true;
+                LimeLog.warning("sendWifiQuality stub - pending JNI implementation");
+            }
+            return;
+        }
+        // TODO: invoke native method once moonlight-common-c has the extension.
     }
 }
