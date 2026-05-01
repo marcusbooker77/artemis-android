@@ -132,7 +132,21 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
     private boolean hasGameController;
     private boolean stopped = false;
 
-    // Stats overlay toggle: Select+L1 held for 2 seconds
+    // Stats overlay toggle: combo held for STATS_OVERLAY_HOLD_TIME_MS
+    //
+    // The user can collide BACK+LB with in-game combos (weapon swap, etc.). The hold-to-toggle
+    // currently STILL sends the inputs to the host while the timer runs, so the in-game effect
+    // fires every time the user wants to toggle stats. To make the combo configurable later,
+    // we use a single key string here. The default `select_l1` matches existing behavior.
+    //
+    // TODO(prefs): wire `controller_stats_overlay_combo` into PreferenceConfiguration so the
+    //   end user can change to `select_r3` (long-press) or another less-collision-prone combo.
+    //   For now this constant is the single source of truth and the combo registry is hard-coded
+    //   below in handleButtonDown / handleButtonUp on the BACK_FLAG | LB_FLAG path.
+    static final String DEFAULT_STATS_OVERLAY_COMBO = "select_l1";
+    @SuppressWarnings("FieldCanBeLocal")
+    private final String statsOverlayCombo = DEFAULT_STATS_OVERLAY_COMBO;
+
     private boolean selectL1HoldPending;
     private final Runnable statsOverlayToggleRunnable = new Runnable() {
         @Override
@@ -143,6 +157,26 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
             }
         }
     };
+
+    /**
+     * Centralized cancel for the stats-overlay hold timer.
+     *
+     * Race avoidance: callers MUST invoke this AFTER the inputMap has been updated for the
+     * current frame (i.e. after the down/up bit-flip), so we observe the post-release state
+     * rather than the pre-release state. Safe to call when no timer is pending.
+     */
+    private void cancelStatsOverlayHoldIfComboBroken(int currentInputMap) {
+        if (!selectL1HoldPending) {
+            return;
+        }
+        if ((currentInputMap & ControllerPacket.BACK_FLAG) == 0 ||
+                (currentInputMap & ControllerPacket.LB_FLAG) == 0) {
+            selectL1HoldPending = false;
+            // Defensive: removeCallbacks on every transition that releases either BACK or LB,
+            // so an earlier-scheduled runnable cannot fire after the user has released.
+            mainThreadHandler.removeCallbacks(statsOverlayToggleRunnable);
+        }
+    }
 
     private final PreferenceConfiguration prefConfig;
     private short currentControllers, initialControllers;
@@ -2713,13 +2747,10 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
             }
         }
 
-        // Cancel stats overlay toggle if Select or L1 was released
-        if (selectL1HoldPending &&
-                ((context.inputMap & ControllerPacket.BACK_FLAG) == 0 ||
-                 (context.inputMap & ControllerPacket.LB_FLAG) == 0)) {
-            selectL1HoldPending = false;
-            mainThreadHandler.removeCallbacks(statsOverlayToggleRunnable);
-        }
+        // Cancel stats overlay toggle if Select or L1 was released. This runs AFTER the inputMap
+        // has been updated above for this frame, so we observe the post-release state and avoid
+        // the race where an earlier-scheduled runnable fires after the user has already let go.
+        cancelStatsOverlayHoldIfComboBroken(context.inputMap);
 
         sendControllerInputPacket(context);
 
@@ -2959,7 +2990,10 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
             }
         }
 
-        // Select+L1 held for 2 seconds toggles the stats overlay
+        // Select+L1 held for 2 seconds toggles the stats overlay (combo registry: see
+        // DEFAULT_STATS_OVERLAY_COMBO at top of class). The cancel branch is defensive — every
+        // path that mutates inputMap to release BACK or LB also routes through
+        // cancelStatsOverlayHoldIfComboBroken at the end of handleButtonUp.
         if ((context.inputMap & ControllerPacket.BACK_FLAG) != 0 &&
                 (context.inputMap & ControllerPacket.LB_FLAG) != 0) {
             if (!selectL1HoldPending) {
@@ -2967,11 +3001,9 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
                 mainThreadHandler.postDelayed(statsOverlayToggleRunnable, STATS_OVERLAY_HOLD_TIME_MS);
             }
         } else {
-            // Combo broken, cancel pending toggle
-            if (selectL1HoldPending) {
-                selectL1HoldPending = false;
-                mainThreadHandler.removeCallbacks(statsOverlayToggleRunnable);
-            }
+            // Combo broken on this frame's down event (e.g. some other key intercept cleared
+            // the bit). Use the centralized cancel to keep semantics consistent.
+            cancelStatsOverlayHoldIfComboBroken(context.inputMap);
         }
 
         // We don't need to send repeat key down events, but the platform

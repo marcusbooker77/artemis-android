@@ -47,7 +47,32 @@ public class StatsOverlay extends View {
     private static final float LINE_SPACING_DP = 2f;
     private static final float CORNER_RADIUS_DP = 4f;
 
+    /**
+     * StringBuilder reused across redraws to avoid GC pressure from repeated `new StringBuilder()`.
+     * Note that `.toString()` on a StringBuilder DOES allocate a String — total allocations per
+     * redraw = number of distinct text labels. The win vs the naive approach is in avoiding the
+     * auto-grow path of fresh builders (and the per-call Formatter+intermediate-String allocations
+     * that String.format would incur), not in avoiding all allocation.
+     */
     private final StringBuilder reusableSb = new StringBuilder(128);
+
+    // Cached values used to detect "no actual change" so we can skip invalidate() on no-op updates.
+    private boolean hasCachedClient;
+    private float cachedDecodeMs = Float.NaN;
+    private float cachedRenderMs = Float.NaN;
+    private float cachedNetworkMs = Float.NaN;
+    private int cachedFps = -1;
+    private String cachedCodec = null;
+
+    private boolean hasCachedServer;
+    private int cachedBitrate = -1;
+    private int cachedFecPct = -1;
+    private int cachedThermal = -1;
+
+    private boolean hasCachedWifi;
+    private int cachedWifiQuality = -1;
+    private int cachedWifiRssi = Integer.MIN_VALUE;
+    private int cachedWifiLinkSpeed = -1;
 
     public StatsOverlay(Context context) {
         this(context, null);
@@ -94,6 +119,8 @@ public class StatsOverlay extends View {
                 mode = Mode.OFF;
                 break;
         }
+        // Mode change forces a repaint regardless of value-equality caches.
+        clearDirtyCaches();
         invalidate();
     }
 
@@ -103,7 +130,18 @@ public class StatsOverlay extends View {
 
     public void setMode(Mode mode) {
         this.mode = mode;
+        clearDirtyCaches();
         invalidate();
+    }
+
+    /**
+     * Reset the "last rendered values" caches. Called on mode transitions so that the next
+     * stats update is treated as dirty even if the underlying values are unchanged.
+     */
+    private void clearDirtyCaches() {
+        hasCachedClient = false;
+        hasCachedServer = false;
+        hasCachedWifi = false;
     }
 
     @Override
@@ -178,13 +216,35 @@ public class StatsOverlay extends View {
         }
     }
 
+    /**
+     * Append `v` formatted with one decimal place, followed by `suffix`. Avoids the
+     * Formatter + intermediate-String allocations of String.format on the hot draw path.
+     * Negative values are emitted with a leading '-'. Rounding is half-up at the tenths place.
+     */
+    private static void appendOneDecimal(StringBuilder sb, float v, String suffix) {
+        if (Float.isNaN(v) || Float.isInfinite(v)) {
+            sb.append(v).append(suffix);
+            return;
+        }
+        if (v < 0) {
+            sb.append('-');
+            v = -v;
+        }
+        // Round half-up at the tenths place: scale * 10, +0.5, truncate.
+        int scaled = (int)(v * 10f + 0.5f);
+        int intPart = scaled / 10;
+        int decPart = scaled % 10;
+        sb.append(intPart).append('.').append(decPart).append(suffix);
+    }
+
     private String buildCompactLine() {
         reusableSb.setLength(0);
         reusableSb.append(fps).append(" FPS");
         if (codec != null && !codec.isEmpty()) {
             reusableSb.append(" | ").append(codec);
         }
-        reusableSb.append(" | ").append(String.format("%.1fms", decodeTimeMs));
+        reusableSb.append(" | ");
+        appendOneDecimal(reusableSb, decodeTimeMs, "ms");
         reusableSb.append(" | WiFi ").append(getWifiQualityLabel());
         if (serverThermalState > 0) {
             reusableSb.append(" | ").append(getThermalLabel());
@@ -204,26 +264,46 @@ public class StatsOverlay extends View {
         String line0 = reusableSb.toString();
 
         reusableSb.setLength(0);
-        String line1 = reusableSb.append("Decode: ").append(String.format("%.1f ms", decodeTimeMs)).toString();
+        reusableSb.append("Decode: ");
+        appendOneDecimal(reusableSb, decodeTimeMs, " ms");
+        String line1 = reusableSb.toString();
 
         reusableSb.setLength(0);
-        String line2 = reusableSb.append("Render: ").append(String.format("%.1f ms", renderTimeMs)).toString();
+        reusableSb.append("Render: ");
+        appendOneDecimal(reusableSb, renderTimeMs, " ms");
+        String line2 = reusableSb.toString();
 
         reusableSb.setLength(0);
-        String line3 = reusableSb.append("Network: ").append(String.format("%.1f ms", networkLatencyMs)).toString();
+        reusableSb.append("Network: ");
+        appendOneDecimal(reusableSb, networkLatencyMs, " ms");
+        String line3 = reusableSb.toString();
 
         reusableSb.setLength(0);
-        String line4 = reusableSb.append("Bitrate: ").append(serverBitrate > 0 ? serverBitrate + " kbps" : "N/A").toString();
+        reusableSb.append("Bitrate: ");
+        if (serverBitrate > 0) {
+            reusableSb.append(serverBitrate).append(" kbps");
+        } else {
+            reusableSb.append("N/A");
+        }
+        String line4 = reusableSb.toString();
 
         reusableSb.setLength(0);
-        String line5 = reusableSb.append("FEC: ").append(serverBitrate > 0 ? serverFecPct + "%" : "N/A").toString();
+        reusableSb.append("FEC: ");
+        if (serverBitrate > 0) {
+            reusableSb.append(serverFecPct).append('%');
+        } else {
+            reusableSb.append("N/A");
+        }
+        String line5 = reusableSb.toString();
 
         reusableSb.setLength(0);
-        String line6 = reusableSb.append(thermalPrefix).append("Thermal: ").append(getThermalLabel()).toString();
+        reusableSb.append(thermalPrefix).append("Thermal: ").append(getThermalLabel());
+        String line6 = reusableSb.toString();
 
         reusableSb.setLength(0);
-        String line7 = reusableSb.append(wifiPrefix).append("WiFi: ").append(getWifiQualityLabel())
-                .append(" (").append(wifiRssi).append(" dBm, ").append(wifiLinkSpeed).append(" Mbps)").toString();
+        reusableSb.append(wifiPrefix).append("WiFi: ").append(getWifiQualityLabel())
+                .append(" (").append(wifiRssi).append(" dBm, ").append(wifiLinkSpeed).append(" Mbps)");
+        String line7 = reusableSb.toString();
 
         return new String[] { line0, line1, line2, line3, line4, line5, line6, line7 };
     }
@@ -260,16 +340,32 @@ public class StatsOverlay extends View {
 
     /**
      * Update stats received from the server via control channel.
+     * Only invalidates if a value actually changed (avoids redundant redraws of unchanged frames).
      */
     public void updateServerStats(int bitrate, int fecPct, int thermal) {
         this.serverBitrate = bitrate;
         this.serverFecPct = fecPct;
         this.serverThermalState = thermal;
+        if (mode == Mode.OFF) {
+            return;
+        }
+        boolean dirty = !hasCachedServer
+                || cachedBitrate != bitrate
+                || cachedFecPct != fecPct
+                || cachedThermal != thermal;
+        if (!dirty) {
+            return;
+        }
+        hasCachedServer = true;
+        cachedBitrate = bitrate;
+        cachedFecPct = fecPct;
+        cachedThermal = thermal;
         invalidate();
     }
 
     /**
      * Update client-measured stats.
+     * Only invalidates if a value actually changed.
      */
     public void updateClientStats(float decode, float render, float network, int fps, String codec) {
         this.decodeTimeMs = decode;
@@ -277,16 +373,50 @@ public class StatsOverlay extends View {
         this.networkLatencyMs = network;
         this.fps = fps;
         this.codec = codec;
+        if (mode == Mode.OFF) {
+            return;
+        }
+        // Compare floats by bits to handle NaN consistently and avoid `==` on NaN returning false forever.
+        boolean dirty = !hasCachedClient
+                || Float.floatToRawIntBits(cachedDecodeMs) != Float.floatToRawIntBits(decode)
+                || Float.floatToRawIntBits(cachedRenderMs) != Float.floatToRawIntBits(render)
+                || Float.floatToRawIntBits(cachedNetworkMs) != Float.floatToRawIntBits(network)
+                || cachedFps != fps
+                || (cachedCodec == null ? codec != null : !cachedCodec.equals(codec));
+        if (!dirty) {
+            return;
+        }
+        hasCachedClient = true;
+        cachedDecodeMs = decode;
+        cachedRenderMs = render;
+        cachedNetworkMs = network;
+        cachedFps = fps;
+        cachedCodec = codec;
         invalidate();
     }
 
     /**
      * Update WiFi stats from WifiMonitor.
+     * Only invalidates if a value actually changed.
      */
     public void updateWifiStats(int quality, int rssi, int linkSpeed) {
         this.wifiQuality = quality;
         this.wifiRssi = rssi;
         this.wifiLinkSpeed = linkSpeed;
+        if (mode == Mode.OFF) {
+            return;
+        }
+        boolean dirty = !hasCachedWifi
+                || cachedWifiQuality != quality
+                || cachedWifiRssi != rssi
+                || cachedWifiLinkSpeed != linkSpeed;
+        if (!dirty) {
+            return;
+        }
+        hasCachedWifi = true;
+        cachedWifiQuality = quality;
+        cachedWifiRssi = rssi;
+        cachedWifiLinkSpeed = linkSpeed;
         invalidate();
     }
 }
