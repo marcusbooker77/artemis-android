@@ -241,6 +241,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
     private WifiMonitor wifiMonitor;
     private boolean smartReconnectEnabled = true;
     private static final int SMART_RECONNECT_MAX_ATTEMPTS = 6;
+    private volatile Thread reconnectWorker;
 
     private WifiManager.WifiLock highPerfWifiLock;
     private WifiManager.WifiLock lowLatencyWifiLock;
@@ -1724,6 +1725,23 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
         instance = null;
         timerHandler.removeCallbacksAndMessages(null);
+
+        // Unconditionally clear the native server stats listener -- even if
+        // stopConnection() already nulled it, this guards against a JNI callback
+        // arriving after the Activity is gone (C3).
+        try {
+            MoonBridge.setServerStatsListener(null);
+        } catch (Throwable t) {
+            // Best-effort; never let teardown throw.
+        }
+
+        // Interrupt and drop any in-flight smart-reconnect worker so its
+        // runOnUiThread posts cannot resurrect a destroyed Activity (C2).
+        Thread worker = reconnectWorker;
+        if (worker != null) {
+            worker.interrupt();
+            reconnectWorker = null;
+        }
 
         if (prefConfig.enableFullExDisplay) handleDisplayRemoved();
 
@@ -3617,28 +3635,44 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         // Attempt smart reconnect: freeze frame is automatic (we don't clear the surface)
         LimeLog.info("Connection lost (error " + errorCode + "), attempting smart reconnect...");
 
+        // Capture the original Intent so we can relaunch the Activity from scratch.
+        // This guarantees a clean rebuild of NvConnection, AndroidAudioRenderer, the
+        // decoder, the surface, and the moonlight-common-c bridge -- which is the
+        // only safe sequence after LiCleanupBridge.
+        final Intent relaunchIntent = new Intent(getIntent());
+        relaunchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
+                if (isFinishing() || isDestroyed()) return;
                 if (reconnectOverlay != null) {
                     reconnectOverlay.show(SMART_RECONNECT_MAX_ATTEMPTS);
                 }
             }
         });
 
-        // Run reconnect attempts on a background thread
-        new Thread(new Runnable() {
+        // Run reconnect attempts on a background thread. We only poll for network
+        // availability here; the actual reconnect is performed by relaunching the
+        // Activity, which gives us a fresh NvConnection + audio renderer + bridge.
+        Thread worker = new Thread(new Runnable() {
             @Override
             public void run() {
-                boolean reconnected = false;
+                boolean networkRestored = false;
 
                 for (int attempt = 1; attempt <= SMART_RECONNECT_MAX_ATTEMPTS; attempt++) {
+                    if (Thread.currentThread().isInterrupted()) {
+                        LimeLog.info("Reconnect worker interrupted, bailing out");
+                        return;
+                    }
+
                     final int currentAttempt = attempt;
                     LimeLog.info("Reconnect attempt " + attempt + "/" + SMART_RECONNECT_MAX_ATTEMPTS);
 
                     runOnUiThread(new Runnable() {
                         @Override
                         public void run() {
+                            if (isFinishing() || isDestroyed()) return;
                             if (reconnectOverlay != null) {
                                 reconnectOverlay.setAttempt(currentAttempt);
                             }
@@ -3649,58 +3683,52 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                     try {
                         Thread.sleep(500L * attempt);
                     } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+
+                    if (Thread.currentThread().isInterrupted()) {
+                        return;
+                    }
+
+                    // Check if WiFi/network is available; once it is, relaunch the Activity.
+                    if (isNetworkAvailable()) {
+                        networkRestored = true;
+                        LimeLog.info("Network available, relaunching Game activity for clean reconnect");
                         break;
                     }
 
-                    // Check if WiFi/network is available
-                    if (!isNetworkAvailable()) {
-                        LimeLog.info("No network available, skipping attempt " + attempt);
-                        continue;
-                    }
-
-                    // Attempt to reconnect by stopping and restarting the connection
-                    try {
-                        synchronized (MoonBridge.class) {
-                            MoonBridge.stopConnection();
-                            MoonBridge.cleanupBridge();
-                        }
-
-                        // Re-start the connection with the same parameters
-                        if (conn != null && surfaceCreated && streamContainer.getSurface().isValid()) {
-                            decoderRenderer.setRenderTarget(streamContainer.getSurface());
-                            conn.start(new AndroidAudioRenderer(Game.this, prefConfig.playHostAudio),
-                                    decoderRenderer, Game.this);
-
-                            // Wait briefly to see if connection succeeds
-                            Thread.sleep(2000);
-
-                            if (connected) {
-                                reconnected = true;
-                                LimeLog.info("Reconnect succeeded on attempt " + attempt);
-                                break;
-                            }
-                        }
-                    } catch (Exception e) {
-                        LimeLog.warning("Reconnect attempt " + attempt + " failed: " + e.getMessage());
-                    }
+                    LimeLog.info("No network available, retrying...");
                 }
 
-                final boolean success = reconnected;
+                final boolean shouldRelaunch = networkRestored;
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
+                        if (isFinishing() || isDestroyed()) return;
+
                         if (reconnectOverlay != null) {
                             reconnectOverlay.hide();
                         }
 
-                        if (!success) {
-                            // All attempts failed, fall through to normal disconnect handling
+                        if (shouldRelaunch) {
+                            // Tear down this Activity and start a fresh one with the same
+                            // Intent extras. This is the cleanest reset for stats overlay,
+                            // decoder, surface state, NvConnection, audio renderer, and
+                            // the moonlight-common-c bridge.
+                            quitOnStop = false;
+                            startActivity(relaunchIntent);
+                            finish();
+                        } else {
+                            // No network came back in time -- fall through to normal disconnect.
                             handleConnectionTerminatedFinal(errorCode);
                         }
                     }
                 });
             }
-        }).start();
+        });
+        reconnectWorker = worker;
+        worker.start();
     }
 
     /**
