@@ -117,7 +117,9 @@ public class WifiMonitor {
                             if (transportInfo instanceof WifiInfo) {
                                 WifiInfo wifiInfo = (WifiInfo) transportInfo;
                                 int wifiRssi = wifiInfo.getRssi();
-                                if (wifiRssi != WifiManager.UNKNOWN_RSSI && wifiRssi != 0) {
+                                // -127 is WifiInfo.INVALID_RSSI (hidden constant); 0 is the
+                                // location-permission stub sentinel on API 31+.
+                                if (wifiRssi != -127 && wifiRssi != 0 && wifiRssi != Integer.MIN_VALUE) {
                                     rssi = wifiRssi;
                                 }
                                 linkSpeed = wifiInfo.getLinkSpeed();
