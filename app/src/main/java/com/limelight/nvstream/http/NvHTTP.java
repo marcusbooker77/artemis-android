@@ -830,14 +830,9 @@ public class NvHTTP {
     final private static char[] hexArray = "0123456789ABCDEF".toCharArray();
 
     private static boolean isTruthyXmlBoolean(String value) {
-        if (value == null) {
-            return false;
-        }
-
-        String normalized = value.trim();
-        return normalized.equalsIgnoreCase("true") ||
-                normalized.equals("1") ||
-                normalized.equalsIgnoreCase("yes");
+        // Apollo only emits "true" for these XML booleans; strict match avoids
+        // false positives from arbitrary truthy-looking server output.
+        return "true".equalsIgnoreCase(value != null ? value.trim() : null);
     }
 
     private static String bytesToHex(byte[] bytes) {

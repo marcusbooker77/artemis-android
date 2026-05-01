@@ -20,8 +20,23 @@
 -keep class com.limelight.profiles.ProfilesManager$ProfilesData {*;}
 -keep class com.limelight.profiles.SettingsProfile {*;}
 
-# Moonlight common
--keep class com.limelight.nvstream.jni.* {*;}
+# Moonlight common — JNI bridge. Use .** to also keep nested types
+# (MoonBridge$ServerStatsListener, MoonBridge$AudioConfiguration, etc.)
+# since R8 may otherwise strip nested interfaces dispatched to from native.
+-keep class com.limelight.nvstream.jni.** {*;}
+-keepclassmembers class com.limelight.nvstream.jni.MoonBridge {
+    public static <fields>;
+    public static <methods>;
+}
+-keep interface com.limelight.nvstream.jni.MoonBridge$ServerStatsListener {*;}
+
+# PerfOverlayListener — implementations are passed to native via setupBridge
+# and dispatched from JNI callbacks; keep the interface so R8 cannot rename
+# its abstract methods out from under reflection-style native dispatch.
+-keep interface com.limelight.binding.video.PerfOverlayListener {*;}
+-keep class * implements com.limelight.binding.video.PerfOverlayListener {
+    public <methods>;
+}
 
 # Okio
 -keep class sun.misc.Unsafe {*;}

@@ -68,10 +68,18 @@ public class ReconnectOverlay extends View {
      */
     public void show(int maxAttempts) {
         this.maxAttempts = maxAttempts;
+        // Intentional: counter is hidden until the first setAttempt(1) call;
+        // brief visual pause is acceptable and matches reconnection semantics.
         this.currentAttempt = 0;
         this.active = true;
         setVisibility(VISIBLE);
-        startPulseAnimation();
+        // Avoid race during onCreate: if not yet attached, the ValueAnimator's
+        // invalidate() callbacks won't take effect. Defer until attach.
+        if (isAttachedToWindow()) {
+            startPulseAnimation();
+        } else {
+            post(this::startPulseAnimation);
+        }
         invalidate();
     }
 

@@ -172,6 +172,23 @@ public class MediaCodecHelper {
             whitelistedHevcDecoders.add("omx.mtk");
         }
 
+        // Hisense Google TVs (Pentonic SoC, 2023+) ship buggy MediaTek video codecs;
+        // the AOSP omx.mtk.* fallback path produces stable decode where c2.mediatek.*
+        // stalls. Symptom: black-screen on Pentonic-based TVs (e.g. U7K, U8K, ULED X).
+        // Narrow scope: Hisense + known TV model substrings + Android 13+ only.
+        // Note: using Build.MODEL containment (Option C) since this static initializer
+        // has no Context available. Less precise than UiModeManager, but Hisense phones
+        // do not match these TV-specific model substrings.
+        if (Build.MANUFACTURER.equalsIgnoreCase("Hisense") &&
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            String model = Build.MODEL != null ? Build.MODEL.toUpperCase(Locale.ENGLISH) : "";
+            if (model.contains("U7K") || model.contains("U8K") || model.contains("U9K") ||
+                    model.contains("U7N") || model.contains("U8N") || model.contains("U9N") ||
+                    model.contains("ULED") || model.contains("PENTONIC")) {
+                whitelistedHevcDecoders.add("omx.mtk");
+            }
+        }
+
         // Amlogic requires 1 reference frame for HEVC to avoid hanging. Since it's been years
         // since GFE added support for maxNumReferenceFrames, we'll just enable all Amlogic SoCs
         // running Android 9 or later.
